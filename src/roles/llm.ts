@@ -12,6 +12,9 @@
 import type { AssistantMessage, Model, Tool, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 
+/** 角色 LLM 调用的默认单次超时（90s）。可通过 RoleCallOptions.timeoutMs 覆盖。 */
+export const DEFAULT_ROLE_TIMEOUT_MS = 90_000;
+
 export interface RoleCallOptions {
 	model: Model<any>;
 	systemPrompt: string;
@@ -23,6 +26,8 @@ export interface RoleCallOptions {
 	/** OAuth 类 provider 的额外请求头 */
 	headers?: Record<string, string>;
 	signal?: AbortSignal;
+	/** 单次 LLM 调用超时（默认 90s）。防止 provider 挂起导致 run 无限冻结。 */
+	timeoutMs?: number;
 }
 
 export interface RoleCallOk {
@@ -62,6 +67,11 @@ export async function callRoleTool(options: RoleCallOptions): Promise<RoleCallRe
 		{ role: "user", content: options.userMessage },
 	];
 
+	// 单次调用超时兜底：provider 挂起时收敛到失败，走已有降级路径，而非无限冻结
+	const timeoutMs = options.timeoutMs ?? DEFAULT_ROLE_TIMEOUT_MS;
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		let message: AssistantMessage;
 		try {
@@ -72,14 +82,20 @@ export async function callRoleTool(options: RoleCallOptions): Promise<RoleCallRe
 					messages: messages as never,
 					tools: [options.tool],
 				},
-				{ apiKey: options.apiKey, headers: options.headers, signal: options.signal } as never,
+				{ apiKey: options.apiKey, headers: options.headers, signal } as never,
 			);
 		} catch (err) {
 			return { ok: false, reason: `LLM call failed: ${err instanceof Error ? err.message : String(err)}` };
 		}
 
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
-			return { ok: false, reason: `LLM call ${message.stopReason}: ${message.errorMessage ?? ""}` };
+			const isTimeout = timeoutSignal.aborted && !options.signal?.aborted;
+			return {
+				ok: false,
+				reason: isTimeout
+					? `LLM call timed out after ${timeoutMs}ms`
+					: `LLM call ${message.stopReason}: ${message.errorMessage ?? ""}`,
+			};
 		}
 
 		const args = extractToolArgs(message, options.tool.name);

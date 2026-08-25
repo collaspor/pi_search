@@ -43,12 +43,17 @@ Never fabricate. "Not found" is an acceptable and valuable answer.
 ${UNTRUSTED_ANCHOR}`;
 }
 
+/** Executor 单轮 LLM 调用的默认超时（120s）。可通过 ExecuteTaskOptions.llmTimeoutMs 覆盖。 */
+export const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+
 export interface ExecuteTaskOptions {
 	model: Model<any>;
 	apiKey?: string;
 	headers?: Record<string, string>;
 	signal?: AbortSignal;
 	maxTurns?: number;
+	/** 单轮 LLM 调用超时（默认 120s） */
+	llmTimeoutMs?: number;
 	onToolEvent?: (text: string) => void;
 }
 
@@ -117,6 +122,11 @@ export async function executeTask(env: ToolEnv, task: Task, options: ExecuteTask
 		}
 	};
 
+	// 单轮 LLM 调用超时兜底：防止 provider 挂起导致 Task 无限冻结（M6 修复）
+	const timeoutMs = options.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS;
+	const llmTimeoutSignal = AbortSignal.timeout(timeoutMs);
+	const callSignal = options.signal ? AbortSignal.any([options.signal, llmTimeoutSignal]) : llmTimeoutSignal;
+
 	try {
 		const newMessages = await runAgentLoop(
 			[promptMessage],
@@ -126,11 +136,12 @@ export async function executeTask(env: ToolEnv, task: Task, options: ExecuteTask
 				convertToLlm: (messages: AgentMessage[]) => messages as never,
 				apiKey: options.apiKey,
 				headers: options.headers,
-				signal: options.signal,
+				signal: callSignal,
+				timeoutMs,
 				shouldStopAfterTurn,
 			} as never,
 			async () => {},
-			options.signal,
+			callSignal,
 			streamSimple as never,
 		);
 

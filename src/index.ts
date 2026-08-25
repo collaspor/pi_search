@@ -113,15 +113,25 @@ export default function (pi: ExtensionAPI) {
 					...tasks.map((t) => `  ${t.id} ${t.title}  [${t.criterionIds.join(",")}]`),
 					"",
 					`产物目录：${runDir}`,
-					"研究与报告将在后续里程碑接入。",
+					`状态：${run.status}`,
+					`报告：${join(runDir, "report.md")}`,
 				];
 				pi.sendMessage({ customType: "research-result", display: true, content: lines.join("\n") });
+				// print 模式下 sendMessage 不可见，终态额外写 stderr 保证可见
+				if (!ctx.hasUI) {
+					console.error(
+						`[research] ${run.status}：${run.claims.length} 条结论，报告 ${join(runDir, "report.md")}`,
+					);
+				}
 			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
 				pi.sendMessage({
 					customType: "research-error",
 					display: true,
-					content: `[research] 执行失败：${err instanceof Error ? err.message : String(err)}`,
+					content: `[research] 执行失败：${message}`,
 				});
+				// print 模式失败必须可见（修复：之前静默退出无任何提示）
+				console.error(`[research] 执行失败：${message}`);
 			}
 		},
 	});
