@@ -15,6 +15,7 @@ import { fetchWithRetry } from "../net/http.ts";
 import { createTavilyProvider } from "../providers/tavily.ts";
 import type { SearchProvider } from "../providers/types.ts";
 import { renderGaps } from "../report/gaps.ts";
+import { exportRunHtml } from "../report/html.ts";
 import { removeViolatingCitations, renderReport } from "../report/markdown.ts";
 import { comprehend } from "../roles/comprehender.ts";
 import { executeTask } from "../roles/executor.ts";
@@ -470,6 +471,15 @@ async function runReportingPhase(
 	await store.appendEvent({ type: "verification_done", report: run.verification });
 	await store.appendEvent({ type: "run_end", status: run.status });
 	await writeReport(runDir, run.report);
+
+	// HTML 溯源报告：展示层产物，导出失败绝不影响 run 终态（仅记 warning）
+	try {
+		const htmlPath = await exportRunHtml(runDir, run, run.report);
+		options.onProgress?.(`HTML 溯源报告：${htmlPath}`);
+	} catch (err) {
+		options.onProgress?.(`HTML 导出失败（不影响报告）：${err instanceof Error ? err.message : String(err)}`);
+	}
+
 	await snapshot();
 
 	options.onProgress?.(`报告完成：${run.status}，${run.claims.length} 条结论。${join(runDir, "report.md")}`);

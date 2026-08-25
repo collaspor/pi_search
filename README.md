@@ -5,7 +5,7 @@
     基于 <a href="https://github.com/earendil-works/pi">pi</a> Agent 框架二次开发的扩展插件
   </p>
   <p align="center">
-    <img alt="tests" src="https://img.shields.io/badge/tests-246%20passing-brightgreen?style=flat-square" />
+    <img alt="tests" src="https://img.shields.io/badge/tests-260%20passing-brightgreen?style=flat-square" />
     <img alt="typescript" src="https://img.shields.io/badge/TypeScript-strict%20%2B%20erasable-blue?style=flat-square" />
     <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
     <img alt="status" src="https://img.shields.io/badge/pipeline-end--to--end%20verified-success?style=flat-square" />
@@ -135,11 +135,14 @@ Report: .codebuddy/research/20260825-145232-iis/report.md
 ├── run.json        权威状态快照（brief/plan/sources/evidence/claims/verification）
 ├── events.jsonl    执行事件流（append-only，审计与断点恢复依据）
 ├── report.md       最终报告（含研究空白与校验结果章节）
+├── report.html     自包含溯源报告（点击引用 → quote 在原文中的上下文高亮）
 ├── sources/        抓取的网页原文（quote 定位校验所需）
 └── cache/          搜索/抓取缓存（崩溃恢复后不重复烧钱）
 ```
 
 支持 `/research:resume <runId>` 断点续跑——进程被 kill 后从最后一个 Task 检查点恢复，缓存命中不重复计费。
+
+**HTML 溯源报告**：每个 run 自动导出单文件 `report.html`（inline CSS/JS，双击即开，无需 server）。正文中的 `[^e3]` 引用是可点按钮，点击展开证据面板：quote 在原始网页正文中的上下文高亮（`locator` 区间切片）、来源链接、定位级别（exact/normalized/fuzzy 三色标记，fuzzy 附实际相似度）。旧 run 可用 `/research:export [runId]` 补导。安全与主流程同级：一切动态文本转义、链接协议白名单、`default-src 'none'` CSP——页面不发任何网络请求。
 
 ---
 
@@ -182,6 +185,7 @@ TUI 中输入：
 | `/research:status [runId]` | 查看执行 Trace 树 |
 | `/research:list` | 列出全部 run |
 | `/research:resume <runId>` | 断点续跑 |
+| `/research:export [runId]` | 导出/补导 HTML 溯源报告 |
 
 ---
 
@@ -191,7 +195,7 @@ TUI 中输入：
 npm test
 ```
 
-**246 个测试，全部离线可跑**（faux provider + 注入桩 + mock DNS，零真实网络/LLM 依赖）：
+**260 个测试，全部离线可跑**（faux provider + 注入桩 + mock DNS，零真实网络/LLM 依赖）：
 
 - SSRF 防护（72 例：302 跳私网、IPv4-mapped、DNS rebinding、整数 IPv4 绕过……）
 - 提示注入防护（12 例：真实注入载荷、边界逃逸、Markdown 伪造）

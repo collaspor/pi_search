@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { loadDotEnvDefault } from "./env.ts";
 import { renderRunListItem, renderTrace } from "./observability/trace.ts";
+import { exportRunHtml } from "./report/html.ts";
 import { readEvents } from "./orchestrator/checkpoint.ts";
 import { orchestrate, resumeRun } from "./orchestrator/run.ts";
 import type { ResearchBrief, ResearchRun } from "./types.ts";
@@ -248,6 +249,43 @@ export default function (pi: ExtensionAPI) {
 					customType: "research-error",
 					display: true,
 					content: `[research:resume] ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+		},
+	});
+
+	// ── /research:export [runId]：为已结束的 run 补导 HTML 溯源报告 ──
+	pi.registerCommand("research:export", {
+		description: "Export the self-contained HTML traceability report for a run (latest if no id given)",
+		handler: async (args, ctx) => {
+			try {
+				const base = join(ctx.cwd, ".codebuddy", "research");
+				let runId = args.trim();
+				if (runId === "") {
+					const dirs = (await readdir(base, { withFileTypes: true }))
+						.filter((d) => d.isDirectory())
+						.map((d) => d.name)
+						.sort();
+					runId = dirs[dirs.length - 1];
+					if (!runId) {
+						pi.sendMessage({ customType: "research-error", display: true, content: "还没有任何 research run。" });
+						return;
+					}
+				}
+				const runDir = join(base, runId);
+				const run = JSON.parse(await readFile(join(runDir, "run.json"), "utf8")) as ResearchRun;
+				const markdown = await readFile(join(runDir, "report.md"), "utf8");
+				const htmlPath = await exportRunHtml(runDir, run, markdown);
+				pi.sendMessage({
+					customType: "research-export",
+					display: true,
+					content: `[research:export] HTML 溯源报告：${htmlPath}`,
+				});
+			} catch (err) {
+				pi.sendMessage({
+					customType: "research-error",
+					display: true,
+					content: `[research:export] ${err instanceof Error ? err.message : String(err)}`,
 				});
 			}
 		},

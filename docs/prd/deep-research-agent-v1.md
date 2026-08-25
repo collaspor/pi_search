@@ -1264,3 +1264,16 @@ M1~M2 **零 LLM 零网络**，可立即开工且是全部校验逻辑的地基�
 2. `packages/ai/test` 有 4 个 TS 错误（`claude-sonnet-4.5`/`glm-4.6v`/`glm-5.1`/`glm-5v-turbo` 模型 ID），源于环境搭建时用 npm tarball 模型数据替代被墙的 models.dev，与 deep-research 无关。
 3. `timeout.test.ts` 慢流用例因 faux chunk 延迟（3~5s）逼近 vitest 默认 5s 超时存在 flaky，已加 15s 显式超时。
 
+### B.5 交付后增量：HTML 溯源报告（2026-08-25）
+
+动机：`report.md` 中 `[^e3]` 引用不可点，"每条结论可溯源到原文"这一核心卖点在演示时不可见。评估 Web 前端（server + 页面）后判定非必需，改为**静态 HTML 导出**（成本 1/5，覆盖溯源展示核心价值）。
+
+实现（`src/report/html.ts`，纯函数 + IO 薄壳）：
+- 每个 run 在 reporting 结束时自动导出 `report.html`（导出失败仅记 warning，不影响 run 终态）；旧 run 用 `/research:export [runId]` 补导
+- 单文件自包含（inline CSS/JS/证据 JSON），双击即开，无需 server
+- 点击正文引用 → 证据面板：quote 上下文高亮（locator 区间 ±300 字符切片）、来源链接、定位级别三色标记（fuzzy 附 matchScore）
+- 安全与 §9.2 同级：全文本转义、链接协议白名单、`default-src 'none'` CSP（页面零网络请求）、内嵌 JSON 的 `</script>` 逃逸防护
+- 测试 14 例（`test/html.test.ts`）：渲染子集 / XSS 转义 / context 切片 / URL 过滤 / 内嵌转义。总计 260 例全绿
+
+**为何不做 Web 前端**：核心价值链在 TUI 已闭环；受众是终端开发者；简历与面试的分量来自架构决策而非界面。若未来产品化给非技术用户，再评估 server 方案。
+
