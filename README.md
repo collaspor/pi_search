@@ -5,7 +5,7 @@
     基于 <a href="https://github.com/earendil-works/pi">pi</a> Agent 框架二次开发的扩展插件
   </p>
   <p align="center">
-    <img alt="tests" src="https://img.shields.io/badge/tests-239%20passing-brightgreen?style=flat-square" />
+    <img alt="tests" src="https://img.shields.io/badge/tests-246%20passing-brightgreen?style=flat-square" />
     <img alt="typescript" src="https://img.shields.io/badge/TypeScript-strict%20%2B%20erasable-blue?style=flat-square" />
     <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
     <img alt="status" src="https://img.shields.io/badge/pipeline-end--to--end%20verified-success?style=flat-square" />
@@ -145,17 +145,25 @@ Report: .codebuddy/research/20260825-145232-iis/report.md
 
 ## 快速开始
 
-**前提**：两个 API key（环境变量）
+**前提**：Node.js ≥ 22.19（内置 TS 类型剥离，直跑 TS 源码，无需构建）
 
 ```bash
-export TAVILY_API_KEY="tvly-..."      # 搜索（tavily.com 注册即得，免费 1000 credits/月）
-export DEEPSEEK_API_KEY="sk-..."      # LLM（或 ANTHROPIC_API_KEY / OPENAI_API_KEY 等）
+git clone https://github.com/collaspor/pi_search.git
+cd pi_search
+npm install --ignore-scripts
 ```
 
-**运行**（在 pi monorepo 根目录）：
+在仓库根目录创建 `.env`（已 gitignore，不会提交），写入两个 API key：
 
 ```bash
-node packages/coding-agent/dist/cli.js -e packages/deep-research --model deepseek/deepseek-v4-flash
+TAVILY_API_KEY=tvly-...     # 搜索（tavily.com 注册即得，免费 1000 credits/月）
+DEEPSEEK_API_KEY=sk-...     # LLM（也可用 ANTHROPIC_API_KEY / OPENAI_API_KEY，配合 --model 换模型）
+```
+
+启动（扩展激活时自动加载 `.env`，无需手动 export）：
+
+```bash
+npx pi -e . --model deepseek/deepseek-v4-flash
 ```
 
 TUI 中输入：
@@ -163,6 +171,8 @@ TUI 中输入：
 ```
 /research 调研2026年AI Agent市场，比较OpenAI、Anthropic、Google的产品布局
 ```
+
+先弹 Brief 确认（Enter 开始 / Esc 取消）→ 实时进度 → 报告落盘 `.codebuddy/research/<runId>/report.md`。
 
 **命令**：
 
@@ -178,11 +188,10 @@ TUI 中输入：
 ## 测试
 
 ```bash
-cd packages/deep-research
-node ../../node_modules/vitest/dist/cli.js --run test/
+npm test
 ```
 
-**243 个测试，全部离线可跑**（faux provider + 注入桩 + mock DNS，零真实网络/LLM 依赖）：
+**246 个测试，全部离线可跑**（faux provider + 注入桩 + mock DNS，零真实网络/LLM 依赖）：
 
 - SSRF 防护（72 例：302 跳私网、IPv4-mapped、DNS rebinding、整数 IPv4 绕过……）
 - 提示注入防护（12 例：真实注入载荷、边界逃逸、Markdown 伪造）

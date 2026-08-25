@@ -54,11 +54,11 @@ describe("callRoleTool 超时收敛", () => {
 		});
 		const elapsed = Date.now() - start;
 
-		// 关键断言：在远小于流完 500 token（500 秒）的时间内收敛
+		// 关键断言：远小于流完 500 token 的 500 秒。上界取 10s：首个 chunk 最坏
+		// 5s 不可中断（faux 每 chunk 3~5 token × 1 token/s），余量覆盖调度开销
 		expect(result.ok).toBe(false);
-		expect(elapsed).toBeLessThan(5000);
-		// it 超时 15s：faux 每 chunk 3~5 token、1 token/s → 首个 chunk 的
-		// setTimeout（3~5s）不可中断，收敛耗时逼近 vitest 默认 5s 上限（flaky）
+		expect(elapsed).toBeLessThan(10_000);
+		// it 超时 15s：vitest 默认 5s 不足以容纳首个 chunk 的最坏延迟（flaky 来源）
 	}, 15000);
 
 	it("默认超时是 90s", () => {

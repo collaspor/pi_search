@@ -7,6 +7,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { loadDotEnvDefault } from "./env.ts";
 import { renderRunListItem, renderTrace } from "./observability/trace.ts";
 import { readEvents } from "./orchestrator/checkpoint.ts";
 import { orchestrate, resumeRun } from "./orchestrator/run.ts";
@@ -34,6 +35,9 @@ function formatBrief(brief: ResearchBrief): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	// clone 即用：激活时加载 .env 中的 API key（已存在的真实环境变量优先，不覆盖）
+	loadDotEnvDefault();
+
 	pi.registerFlag("research-no-confirm", {
 		description: "Skip the brief confirmation step for /research",
 		type: "boolean",
