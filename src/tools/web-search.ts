@@ -137,8 +137,8 @@ export function createWebSearchTool(env: ToolEnv): AgentTool<typeof SearchParams
 				}
 			}
 
-			// 调 provider
-			const response = await env.searchProvider.search({ query, maxResults, timeRange });
+			// 调 provider（传 signal：Esc 取消可中断搜索）
+			const response = await env.searchProvider.search({ query, maxResults, timeRange, signal: env.signal });
 			if (!response.ok) {
 				const failureType = response.failureType as FailureType;
 				const details: SearchDetails = {
@@ -150,13 +150,22 @@ export function createWebSearchTool(env: ToolEnv): AgentTool<typeof SearchParams
 					results: [],
 					sourceIds: [],
 				};
-				const text =
-					failureType === "no_search_result"
-						? `Search returned 0 results for "${query}". Try rewriting the query (different keywords, language, or broader scope).`
-						: `Search failed (${failureType}): ${response.message}`;
+				// M6：no_search_result 走策略池引导（每次换不同策略，≤3 次硬上限）
+				let text: string;
+				if (failureType === "no_search_result" && env.failureTracker) {
+					const guidance = env.failureTracker.onSearchNoResult(taskId, query);
+					text = guidance.hint;
+				} else {
+					text =
+						failureType === "no_search_result"
+							? `Search returned 0 results for "${query}". Try rewriting the query (different keywords, language, or broader scope).`
+							: `Search failed (${failureType}): ${response.message}`;
+				}
 				return finish(details, text, true);
 			}
 
+			// 搜索成功：重置该 Task 的 no-result 计数
+			env.failureTracker?.onSearchSuccess(taskId);
 			const results = response.results;
 			if (!env.fresh) await env.cache.setSearch(cacheKey, query, results);
 			const sourceIds = await registerSourcesFromResults(env, results);

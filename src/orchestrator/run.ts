@@ -7,7 +7,7 @@
  * 事件纪律（§4.0.1）：先 appendEvent，阶段结束时 writeSnapshot。
  */
 
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { ResearchCache, SEARCH_CACHE_TTL_MS } from "../net/cache.ts";
@@ -21,9 +21,13 @@ import { executeTask } from "../roles/executor.ts";
 import { plan } from "../roles/planner.ts";
 import { report } from "../roles/reporter.ts";
 import { l1ErrorMessages, verifyL1 } from "../roles/verifier-l1.ts";
+import { isAllSupported, verifyL2 } from "../roles/verifier-l2.ts";
 import type { ToolEnv } from "../tools/env.ts";
-import type { ResearchBrief, ResearchRun, Task } from "../types.ts";
-import { CheckpointStore } from "./checkpoint.ts";
+import type { L2ClaimVerdict, ResearchBrief, ResearchRun, Task } from "../types.ts";
+import { checkBudgetTrip, reportingGate } from "./budget.ts";
+import { CheckpointStore, readEvents } from "./checkpoint.ts";
+import { FailureTracker, runTaskWithRecovery, shouldReplan } from "./failure-policy.ts";
+import { replayEvents } from "./replay.ts";
 import { runWithConcurrency, topologicalLayers } from "./scheduler.ts";
 
 export interface OrchestrateOptions {
@@ -188,59 +192,135 @@ export async function orchestrate(options: OrchestrateOptions): Promise<Orchestr
 		fresh: options.fresh ?? false,
 		fetchCountByTask: new Map(),
 		seq: { source: 1, evidence: 1 },
+		failureTracker: new FailureTracker(),
+		signal: options.signal,
+	};
+
+	// M6：Task 级恢复包装（task_exception 重跑 + insufficient 补充子任务）
+	const executeWithRecovery = async (task: Task, execOpts?: { queryOverride?: string }) => {
+		const effectiveTask = execOpts?.queryOverride ? { ...task, query: execOpts.queryOverride } : task;
+		const outcome = await executeTask(env, effectiveTask, {
+			model: options.model,
+			apiKey: options.apiKey,
+			headers: options.headers,
+			signal: options.signal,
+		});
+		// 补充子任务收集的证据并回原 task（evidence.taskId 归属不变）
+		task.evidenceCount = effectiveTask.evidenceCount;
+		return outcome;
+	};
+
+	const runOneTask = async (task: Task) => {
+		task.status = "running";
+		task.startedAt = Date.now();
+		await store.appendEvent({ type: "task_start", taskId: task.id });
+		options.onProgress?.(`[${task.id}] ${task.title} …`);
+
+		const outcome = await runTaskWithRecovery(task, {
+			executeTask: executeWithRecovery,
+			recordRecovery: async (event) => {
+				const full = { ts: Date.now(), level: "task" as const, ...event } as never;
+				run.recoveries.push(full);
+				await store.appendEvent({ type: "recovery", event: full });
+			},
+		});
+
+		task.status = outcome.status;
+		task.finishedAt = Date.now();
+		task.attempts++;
+		if (outcome.error) task.lastError = outcome.error;
+		await store.appendEvent({
+			type: "task_end",
+			taskId: task.id,
+			status: outcome.status,
+			evidenceCount: task.evidenceCount,
+		});
+		if (outcome.degraded) {
+			await store.appendEvent({
+				type: "recovery",
+				event: {
+					ts: Date.now(),
+					level: "task",
+					taskId: task.id,
+					failureType: "insufficient_evidence",
+					strategy: "accept_degraded",
+					attempt: 1,
+					outcome: "degraded",
+					detail: `证据不足（${task.evidenceCount}/${task.minEvidence}），降级完成`,
+				},
+			});
+		}
+		// M6：每个 Task 结束检查预算熔断
+		await checkBudgetTrip(run, store);
+		await snapshot();
+		options.onProgress?.(
+			`[${task.id}] ${outcome.status === "success" ? "✓" : "⚠"} ${task.evidenceCount} 条证据${run.budget.tripped ? `，预算熔断(${run.budget.tripped})` : ""}`,
+		);
 	};
 
 	const layers = topologicalLayers(planned.plan.tasks);
 	for (const layer of layers) {
-		await runWithConcurrency(layer, options.concurrency ?? 1, async (task: Task) => {
-			task.status = "running";
-			task.startedAt = Date.now();
-			await store.appendEvent({ type: "task_start", taskId: task.id });
-			options.onProgress?.(`[${task.id}] ${task.title} …`);
-
-			const outcome = await executeTask(env, task, {
-				model: options.model,
-				apiKey: options.apiKey,
-				headers: options.headers,
-				signal: options.signal,
-			});
-
-			task.status = outcome.status;
-			task.finishedAt = Date.now();
-			task.attempts++;
-			if (outcome.error) task.lastError = outcome.error;
-			await store.appendEvent({
-				type: "task_end",
-				taskId: task.id,
-				status: outcome.status,
-				evidenceCount: task.evidenceCount,
-			});
-			if (outcome.degraded) {
-				await store.appendEvent({
-					type: "recovery",
-					event: {
-						ts: Date.now(),
-						level: "task",
-						taskId: task.id,
-						failureType: "insufficient_evidence",
-						strategy: "accept_degraded",
-						attempt: 1,
-						outcome: "degraded",
-						detail: `证据不足（${task.evidenceCount}/${task.minEvidence}），降级完成`,
-					},
-				});
-			}
-			await snapshot();
-			options.onProgress?.(
-				`[${task.id}] ${outcome.status === "success" ? "✓" : "⚠"} ${task.evidenceCount} 条证据，${(outcome.usedTokens / 1000).toFixed(1)}k tokens`,
-			);
-		});
+		await runWithConcurrency(layer, options.concurrency ?? 1, runOneTask);
+		// 预算熔断：停止调度后续 Task
+		if (run.budget.tripped !== undefined) break;
 	}
 
-	// ── Phase 4: reporting ─────────────────────────────────────
+	// M6 L3：repeated_task_failure（≥30%）→ Re-plan 1 次
+	if (shouldReplan(planned.plan.tasks, planned.plan.replanCount) && run.budget.tripped === undefined) {
+		planned.plan.replanCount++;
+		const failedTasks = planned.plan.tasks.filter((t) => t.status === "failed" || t.status === "unresolved");
+		run.recoveries.push({
+			ts: Date.now(),
+			level: "run",
+			failureType: "repeated_task_failure",
+			strategy: "replan",
+			attempt: 1,
+			outcome: "degraded",
+			detail: `${failedTasks.length}/${planned.plan.tasks.length} 任务失败（≥30%），触发 Re-plan`,
+		});
+		await store.appendEvent({ type: "recovery", event: run.recoveries[run.recoveries.length - 1] });
+		options.onProgress?.(`${failedTasks.length} 个任务失败，触发 Re-plan 重新规划…`);
+
+		const replanned = await plan({
+			model: options.model,
+			brief: run.brief!,
+			apiKey: options.apiKey,
+			headers: options.headers,
+			signal: options.signal,
+		});
+		// 用重规划的任务替换失败任务（保留已成功任务与其证据）
+		const replacementTasks = replanned.plan.tasks
+			.filter((t) => t.criterionIds.some((id) => failedTasks.some((f) => f.criterionIds.includes(id))))
+			.map((t, i) => ({ ...t, id: `R${i + 1}` }));
+		if (replacementTasks.length > 0) {
+			planned.plan.tasks.push(...replacementTasks);
+			await store.appendEvent({ type: "plan_ready", plan: planned.plan });
+			const replanLayers = topologicalLayers(replacementTasks);
+			for (const layer of replanLayers) {
+				await runWithConcurrency(layer, options.concurrency ?? 1, runOneTask);
+				if (run.budget.tripped !== undefined) break;
+			}
+		}
+	}
+
+	// ── Phase 4: reporting（M6：前置门禁 §8.4）─────────────────
+	const gate = reportingGate(run);
+	if (gate.action === "failed_stub") {
+		run.status = "failed";
+		run.report = buildStubReport(run, gate.reason);
+		await store.appendEvent({ type: "run_end", status: "failed" });
+		await writeReport(runDir, run.report);
+		await snapshot();
+		options.onProgress?.(`研究终止：${gate.reason}，已落盘存根。`);
+		return { run, runDir, cancelled: false };
+	}
+	const degradedReporting = gate.action === "proceed_degraded";
+
 	run.status = "reporting";
 	await store.appendEvent({ type: "phase_enter", phase: "reporting" });
-	options.onProgress?.(`研究完成：共 ${run.evidence.length} 条证据。生成报告中…`);
+	options.onProgress?.(
+		`研究完成：共 ${run.evidence.length} 条证据。生成报告中${degradedReporting ? "（预算熔断，跳过修正轮与 L2）" : "…"}`,
+	);
 
 	const reported = await report({
 		model: options.model,
@@ -320,6 +400,24 @@ export async function orchestrate(options: OrchestrateOptions): Promise<Orchestr
 		finalMarkdown = renderReport(finalMarkdown, evidenceIdSet, sourcesByEvidence).markdown;
 	}
 
+	// ── Phase 5b: L2 语义校验（M7，独立上下文；预算熔断时跳过）──────
+	let l2: L2ClaimVerdict[] = [];
+	let l2Skipped: string | undefined;
+	if (run.budget.tripped !== undefined) {
+		l2Skipped = "budget";
+	} else if (run.claims.length > 0) {
+		options.onProgress?.(`L1 通过，对 ${run.claims.length} 条结论做语义校验…`);
+		l2 = await verifyL2({
+			model: options.model,
+			claims: run.claims,
+			evidence: run.evidence,
+			sources: run.sources,
+			apiKey: options.apiKey,
+			headers: options.headers,
+			signal: options.signal,
+		});
+	}
+
 	// 终态判定 + 报告组装
 	const hasUnresolved = (run.plan?.tasks ?? []).some((t) => t.status === "unresolved" || t.status === "failed");
 	const passed = l1.passed && !hasUnresolved && run.claims.length > 0;
@@ -329,10 +427,30 @@ export async function orchestrate(options: OrchestrateOptions): Promise<Orchestr
 	const l1Note = l1.passed
 		? `- 结构校验：通过（0 悬空引用，${l1.coverage.filter((c) => c.claimCount > 0).length}/${l1.coverage.length} 判据覆盖）`
 		: `- 结构校验：降级通过（剔除 ${l1.danglingCitations.length} 处违规引用后结报）`;
-	const verificationSection = ["", "## 校验结果", "", l1Note, `- 语义校验（L2）：将在下一里程碑接入`].join("\n");
+
+	const l2Notes: string[] = [];
+	if (l2Skipped) {
+		l2Notes.push(`- 语义校验（L2）：已跳过（${l2Skipped}）`);
+	} else if (l2.length > 0) {
+		const counts = { supported: 0, unsupported: 0, conflicting: 0, uncertain: 0 };
+		for (const v of l2) counts[v.verdict]++;
+		l2Notes.push(
+			`- 语义校验：${l2.length} 条结论中 ${counts.supported} supported、${counts.conflicting} conflicting、${counts.uncertain} uncertain、${counts.unsupported} unsupported`,
+		);
+		// §7.2：全部 supported 是橡皮图章信号，主动标注可信度存疑
+		if (isAllSupported(l2)) {
+			l2Notes.push(`- ⚠ 语义校验未产生任何异议：全部判 supported，校验结果可信度存疑（可能存在同源偏差）`);
+		}
+		const conflicting = l2.filter((v) => v.verdict === "conflicting" || v.verdict === "unsupported");
+		for (const v of conflicting.slice(0, 5)) {
+			l2Notes.push(`  - ${v.claimId}（${v.verdict}）：${v.reason}`);
+		}
+	}
+
+	const verificationSection = ["", "## 校验结果", "", l1Note, ...l2Notes].join("\n");
 
 	run.report = [finalMarkdown.trimEnd(), gaps, verificationSection].filter(Boolean).join("\n\n");
-	run.verification = { l1, l2: [], l2Skipped: "L2 将在 M7 接入" };
+	run.verification = { l1, l2, l2Skipped };
 
 	await store.appendEvent({ type: "verification_done", report: run.verification });
 	await store.appendEvent({ type: "run_end", status: run.status });
@@ -376,4 +494,123 @@ async function writeReport(runDir: string, markdown: string): Promise<void> {
 	await writeFile(tmp, markdown, "utf8");
 	const { rename } = await import("node:fs/promises");
 	await rename(tmp, path);
+}
+
+// ============================================================================
+// Resume（PRD §8.4 crash 策略，验收 A9）
+// ============================================================================
+
+/**
+ * 从快照 + 事件流恢复现场，返回可续跑的起点。
+ * 规则（§4.0.1）：run.json 是权威快照，重放 seq > lastSeq 的事件补齐；
+ * resume 从第一个未完成的阶段/任务继续（不依赖 run_end）。
+ */
+export async function resumeRun(options: OrchestrateOptions & { runId: string }): Promise<OrchestrateResult> {
+	const runDir = join(options.cwd, ".codebuddy", "research", options.runId);
+	const snapshotPath = join(runDir, "run.json");
+
+	let snapshot: ResearchRun;
+	try {
+		snapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as ResearchRun;
+	} catch {
+		throw new Error(`无法读取 run 快照：${snapshotPath}（run 不存在或已损坏）`);
+	}
+
+	const events = await readEvents(join(runDir, "events.jsonl"));
+	const { run, succeededToolCalls, resumeFromTaskId } = replayEvents(snapshot, events);
+	const store = await CheckpointStore.open(runDir, run);
+
+	options.onProgress?.(`恢复 run ${options.runId}：状态 ${run.status}，已应用 ${events.length} 条事件`);
+
+	// run 已结束（有 run_end 或终态）→ 拒绝续跑
+	const finalEvents = events.filter((e) => e.type === "run_end");
+	if (finalEvents.length > 0 || run.status === "completed" || run.status === "partial" || run.status === "failed") {
+		options.onProgress?.(`该 run 已结束（${run.status}），无需续跑。报告：${join(runDir, "report.md")}`);
+		return { run, runDir, cancelled: false };
+	}
+
+	// 续跑：从未完成阶段继续。M7 实现 researching 阶段的续跑；
+	// comprehending/planning 阶段极快，崩溃概率低，直接重跑整个 orchestrate 更简单。
+	if (run.status === "researching" && run.plan) {
+		return resumeResearching(run, runDir, store, succeededToolCalls, resumeFromTaskId, options);
+	}
+
+	// 其他阶段：回到主流程重跑（comprehend/plan 会重做，但幂等）
+	options.onProgress?.(`状态 ${run.status} 不支持增量续跑，从头重跑。`);
+	return orchestrate(options);
+}
+
+/** researching 阶段的续跑：跳过已完成 Task，从第一个 pending/running Task 继续 */
+async function resumeResearching(
+	run: ResearchRun,
+	runDir: string,
+	store: CheckpointStore,
+	_succeededToolCalls: Set<string>,
+	resumeFromTaskId: string | undefined,
+	options: OrchestrateOptions,
+): Promise<OrchestrateResult> {
+	const tasks = run.plan!.tasks;
+	const pendingTasks = resumeFromTaskId ? tasks.filter((t) => t.status === "pending") : [];
+	if (pendingTasks.length === 0) {
+		options.onProgress?.("所有任务已完成，进入报告阶段（由主流程处理）。");
+	}
+
+	// 复用主流程的 env 构造（缓存仍在 runDir 下，搜索/抓取缓存命中）
+	const env: ToolEnv = {
+		run,
+		store,
+		cache: new ResearchCache(runDir),
+		searchProvider: options.searchProvider ?? createTavilyProvider(),
+		fetcher: options.fetcher ?? fetchWithRetry,
+		searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
+		fresh: options.fresh ?? false,
+		fetchCountByTask: new Map(),
+		seq: {
+			source: run.sources.length + 1,
+			evidence: run.evidence.length + 1,
+		},
+		failureTracker: new FailureTracker(),
+		signal: options.signal,
+	};
+
+	const snapshot = async () => {
+		run.lastSeq = store.currentSeq;
+		run.updatedAt = Date.now();
+		await store.writeSnapshot(run);
+	};
+
+	const layers = topologicalLayers(pendingTasks);
+	for (const layer of layers) {
+		for (const task of layer) {
+			task.status = "running";
+			task.startedAt = Date.now();
+			await store.appendEvent({ type: "task_start", taskId: task.id });
+			options.onProgress?.(`[${task.id}] ${task.title} …（续跑）`);
+
+			const outcome = await executeTask(env, task, {
+				model: options.model,
+				apiKey: options.apiKey,
+				headers: options.headers,
+				signal: options.signal,
+			});
+
+			task.status = outcome.status;
+			task.finishedAt = Date.now();
+			task.attempts++;
+			if (outcome.error) task.lastError = outcome.error;
+			await store.appendEvent({
+				type: "task_end",
+				taskId: task.id,
+				status: outcome.status,
+				evidenceCount: task.evidenceCount,
+			});
+			await checkBudgetTrip(run, store);
+			await snapshot();
+		}
+		if (run.budget.tripped !== undefined) break;
+	}
+
+	options.onProgress?.(`续跑完成：共 ${run.evidence.length} 条证据。报告阶段由主流程继续。`);
+	// 报告阶段逻辑与主流程一致，交给 orchestrate 后续（此处直接返回，由 index.ts 引导重跑报告）
+	return { run, runDir, cancelled: false };
 }

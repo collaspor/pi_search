@@ -74,8 +74,13 @@ export function createEvidenceRecordTool(env: ToolEnv): AgentTool<typeof RecordP
 				};
 				env.run.recoveries.push(recoveryEvent);
 				await env.store.appendEvent({ type: "recovery", event: recoveryEvent });
-				return fail(`quote could not be located in ${sourceId}: ${located.reason}`);
+				// M6：同 Task 连续 2 次拒收后，指引换来源而非纠缠
+				const guidance = env.failureTracker?.onQuoteRejected(task.id, sourceId);
+				return fail(
+					`quote could not be located in ${sourceId}: ${located.reason}${guidance ? `\n${guidance.hint}` : ""}`,
+				);
 			}
+			env.failureTracker?.onQuoteAccepted(task.id);
 
 			const evidence: Evidence = {
 				id: `e${env.seq.evidence++}`,

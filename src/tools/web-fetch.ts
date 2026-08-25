@@ -162,6 +162,8 @@ export function createWebFetchTool(env: ToolEnv): AgentTool<typeof FetchParams, 
 						`[Fetch failed (${result.failureType}); using ${degraded.strategy} fallback]\n${wrapUntrustedContent(degraded.sourceId, url, text)}`,
 					);
 				}
+				// M6：真正失败（降级也失败）→ 累计并给扩量/收尾指引
+				const hint = env.failureTracker?.onFetchFailure(taskId).hint;
 				return finish(
 					{
 						ok: false,
@@ -170,7 +172,7 @@ export function createWebFetchTool(env: ToolEnv): AgentTool<typeof FetchParams, 
 						truncated: false,
 						fromCache: false,
 					},
-					`Fetch failed (${result.failureType}): ${result.message}`,
+					`Fetch failed (${result.failureType}): ${result.message}${hint ? `\n${hint}` : ""}`,
 					true,
 				);
 			}

@@ -9,6 +9,7 @@
 import type { ResearchCache } from "../net/cache.ts";
 import type { FetchWithRetryOptions, HttpResult } from "../net/http.ts";
 import type { CheckpointStore } from "../orchestrator/checkpoint.ts";
+import type { FailureTracker } from "../orchestrator/failure-policy.ts";
 import type { SearchProvider } from "../providers/types.ts";
 import type { ResearchRun, SourceTier, Task } from "../types.ts";
 
@@ -34,6 +35,10 @@ export interface ToolEnv {
 	 * 必须用对象引用保证全局唯一单调递增。
 	 */
 	seq: { source: number; evidence: number };
+	/** 失败策略追踪器（M6）：搜索改写/抓取失败/quote 拒收的硬计数 */
+	failureTracker?: FailureTracker;
+	/** 当前 Task 的取消信号（M6：搜索/抓取可被取消） */
+	signal?: AbortSignal;
 }
 
 /** URL 规范化：去 utm_* 参数、去 fragment、去尾斜杠，用于去重与缓存键 */

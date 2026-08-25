@@ -1,13 +1,16 @@
 /**
  * Deep Research Agent — pi 扩展入口。
  *
- * M1 安全与骨架 / M2 校验内核 / M3 理解与规划。
- * 研究执行（researching）在 M4 接入。
+ * 全流程：理解 → 规划 → 研究 → 报告 → L1+L2 校验 / 失败兜底 / 断点续跑。
  */
 
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { orchestrate } from "./orchestrator/run.ts";
-import type { ResearchBrief } from "./types.ts";
+import { renderRunListItem, renderTrace } from "./observability/trace.ts";
+import { readEvents } from "./orchestrator/checkpoint.ts";
+import { orchestrate, resumeRun } from "./orchestrator/run.ts";
+import type { ResearchBrief, ResearchRun } from "./types.ts";
 
 function formatBrief(brief: ResearchBrief): string {
 	const lines: string[] = [
@@ -118,6 +121,119 @@ export default function (pi: ExtensionAPI) {
 					customType: "research-error",
 					display: true,
 					content: `[research] 执行失败：${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+		},
+	});
+
+	// ── /research:status [runId]：Trace 树 ─────────────────────
+	pi.registerCommand("research:status", {
+		description: "Show the execution trace of a research run (latest if no id given)",
+		handler: async (args, ctx) => {
+			try {
+				const base = join(ctx.cwd, ".codebuddy", "research");
+				let runId = args.trim();
+				if (runId === "") {
+					const dirs = (await readdir(base, { withFileTypes: true }))
+						.filter((d) => d.isDirectory())
+						.map((d) => d.name)
+						.sort();
+					runId = dirs[dirs.length - 1];
+					if (!runId) {
+						pi.sendMessage({ customType: "research-error", display: true, content: "还没有任何 research run。" });
+						return;
+					}
+				}
+				const runDir = join(base, runId);
+				const run = JSON.parse(await readFile(join(runDir, "run.json"), "utf8")) as ResearchRun;
+				const events = await readEvents(join(runDir, "events.jsonl"));
+				pi.sendMessage({ customType: "research-trace", display: true, content: renderTrace(run, events) });
+			} catch (err) {
+				pi.sendMessage({
+					customType: "research-error",
+					display: true,
+					content: `[research:status] ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+		},
+	});
+
+	// ── /research:list：列出全部 run ────────────────────────────
+	pi.registerCommand("research:list", {
+		description: "List all research runs",
+		handler: async (_args, ctx) => {
+			try {
+				const base = join(ctx.cwd, ".codebuddy", "research");
+				const dirs = (await readdir(base, { withFileTypes: true }))
+					.filter((d) => d.isDirectory())
+					.map((d) => d.name)
+					.sort();
+				if (dirs.length === 0) {
+					pi.sendMessage({ customType: "research-list", display: true, content: "还没有任何 research run。" });
+					return;
+				}
+				const lines: string[] = [];
+				for (const runId of dirs) {
+					try {
+						const run = JSON.parse(await readFile(join(base, runId, "run.json"), "utf8")) as ResearchRun;
+						lines.push(renderRunListItem(run));
+					} catch {
+						lines.push(`${runId}  [损坏]`);
+					}
+				}
+				pi.sendMessage({ customType: "research-list", display: true, content: lines.join("\n") });
+			} catch (err) {
+				pi.sendMessage({
+					customType: "research-error",
+					display: true,
+					content: `[research:list] ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+		},
+	});
+
+	// ── /research:resume <runId>：断点续跑 ─────────────────────
+	pi.registerCommand("research:resume", {
+		description: "Resume an interrupted research run from its last checkpoint",
+		handler: async (args, ctx) => {
+			const runId = args.trim();
+			if (runId === "") {
+				pi.sendMessage({ customType: "research-error", display: true, content: "用法：/research:resume <runId>" });
+				return;
+			}
+			if (!ctx.model) {
+				pi.sendMessage({ customType: "research-error", display: true, content: "未选择模型。" });
+				return;
+			}
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+			if (!auth.ok) {
+				pi.sendMessage({
+					customType: "research-error",
+					display: true,
+					content: `[research:resume] 无法解析模型凭据：${auth.error}`,
+				});
+				return;
+			}
+			const progress = (text: string) => {
+				pi.sendMessage({ customType: "research-progress", display: true, content: `[research] ${text}` });
+			};
+			try {
+				const result = await resumeRun({
+					runId,
+					query: "",
+					model: ctx.model,
+					cwd: ctx.cwd,
+					signal: ctx.signal,
+					onProgress: progress,
+					apiKey: auth.apiKey,
+					headers: auth.headers as Record<string, string> | undefined,
+				});
+				progress(`续跑结束：${result.run.status}。产物：${result.runDir}`);
+			} catch (err) {
+				pi.sendMessage({
+					customType: "research-error",
+					display: true,
+					content: `[research:resume] ${err instanceof Error ? err.message : String(err)}`,
 				});
 			}
 		},

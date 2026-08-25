@@ -12,8 +12,8 @@ import { ResearchCache, SEARCH_CACHE_TTL_MS } from "../src/net/cache.ts";
 import type { HttpResult } from "../src/net/http.ts";
 import { CheckpointStore } from "../src/orchestrator/checkpoint.ts";
 import { createMockProvider } from "../src/providers/mock.ts";
-import { createEvidenceRecordTool } from "../src/tools/evidence-record.ts";
 import type { ToolEnv } from "../src/tools/env.ts";
+import { createEvidenceRecordTool } from "../src/tools/evidence-record.ts";
 import { createWebFetchTool } from "../src/tools/web-fetch.ts";
 import { createWebSearchTool } from "../src/tools/web-search.ts";
 import type { ResearchRun, Task } from "../src/types.ts";
@@ -32,15 +32,43 @@ afterEach(async () => {
 });
 
 function makeTask(id: string): Task {
-	return { id, title: id, query: "q", rationale: "r", criterionIds: [], dependsOn: [], status: "running", attempts: 0, evidenceCount: 0, minEvidence: 2 };
+	return {
+		id,
+		title: id,
+		query: "q",
+		rationale: "r",
+		criterionIds: [],
+		dependsOn: [],
+		status: "running",
+		attempts: 0,
+		evidenceCount: 0,
+		minEvidence: 2,
+	};
 }
 
 function makeRun(): ResearchRun {
 	return {
-		id: "run-1", query: "q", status: "researching", createdAt: 0, updatedAt: 0, schemaVersion: 1,
-		sources: [], evidence: [], claims: [],
-		budget: { maxTokens: 1e6, maxCostUsd: 10, maxWallClockMs: 1e6, maxTasks: 8, maxFetchPerTask: 5, usedTokens: 0, usedCostUsd: 0, startedAt: 0 },
-		recoveries: [], lastSeq: 0,
+		id: "run-1",
+		query: "q",
+		status: "researching",
+		createdAt: 0,
+		updatedAt: 0,
+		schemaVersion: 1,
+		sources: [],
+		evidence: [],
+		claims: [],
+		budget: {
+			maxTokens: 1e6,
+			maxCostUsd: 10,
+			maxWallClockMs: 1e6,
+			maxTasks: 8,
+			maxFetchPerTask: 5,
+			usedTokens: 0,
+			usedCostUsd: 0,
+			startedAt: 0,
+		},
+		recoveries: [],
+		lastSeq: 0,
 	};
 }
 
@@ -49,11 +77,28 @@ describe("Bug1 修复：seq 跨 taskEnv 视图共享", () => {
 		const run = makeRun();
 		const store = await CheckpointStore.create(dir, run.id);
 		const sharedEnv: ToolEnv = {
-			run, store, cache: new ResearchCache(dir),
-			searchProvider: createMockProvider({ defaultBehavior: { kind: "results", results: [{ url: "https://example.com/x", title: "t", snippet: ARTICLE.slice(0, 80), rawContent: ARTICLE }] } }),
-			fetcher: async (): Promise<HttpResult> => ({ ok: true, status: 200, body: HTML, finalUrl: "https://example.com/x", headers: {} }),
-			searchCacheTtlMs: SEARCH_CACHE_TTL_MS, fresh: false,
-			fetchCountByTask: new Map(), seq: { source: 1, evidence: 1 },
+			run,
+			store,
+			cache: new ResearchCache(dir),
+			searchProvider: createMockProvider({
+				defaultBehavior: {
+					kind: "results",
+					results: [
+						{ url: "https://example.com/x", title: "t", snippet: ARTICLE.slice(0, 80), rawContent: ARTICLE },
+					],
+				},
+			}),
+			fetcher: async (): Promise<HttpResult> => ({
+				ok: true,
+				status: 200,
+				body: HTML,
+				finalUrl: "https://example.com/x",
+				headers: {},
+			}),
+			searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
+			fresh: false,
+			fetchCountByTask: new Map(),
+			seq: { source: 1, evidence: 1 },
 		};
 
 		// 模拟 executor 的 taskEnv 浅拷贝
@@ -66,11 +111,21 @@ describe("Bug1 修复：seq 跨 taskEnv 视图共享", () => {
 		await createWebSearchTool(envA).execute("a1", { query: "q" });
 		await createWebFetchTool(envA).execute("a2", { url: "https://example.com/x" });
 		const recordA = createEvidenceRecordTool(envA);
-		const rA = await recordA.execute("a3", { sourceId: "s1", quote: "人工智能代理市场规模在2026年预计达到1280亿美元", summary: "A", stance: "support" });
+		const rA = await recordA.execute("a3", {
+			sourceId: "s1",
+			quote: "人工智能代理市场规模在2026年预计达到1280亿美元",
+			summary: "A",
+			stance: "support",
+		});
 
 		// Task B：记录（复用同一 source）
 		const recordB = createEvidenceRecordTool(envB);
-		const rB = await recordB.execute("b1", { sourceId: "s1", quote: "年增长率为34.5%", summary: "B", stance: "support" });
+		const rB = await recordB.execute("b1", {
+			sourceId: "s1",
+			quote: "年增长率为34.5%",
+			summary: "B",
+			stance: "support",
+		});
 
 		const idA = rA.details?.evidenceId;
 		const idB = rB.details?.evidenceId;
@@ -90,11 +145,23 @@ describe("Bug1 修复：seq 跨 taskEnv 视图共享", () => {
 		const run = makeRun();
 		const store = await CheckpointStore.create(dir, run.id);
 		const sharedEnv: ToolEnv = {
-			run, store, cache: new ResearchCache(dir),
-			searchProvider: createMockProvider({ defaultBehavior: { kind: "results", results: [{ url: "https://example.com/x", title: "t", snippet: "s" }] } }),
-			fetcher: async (): Promise<HttpResult> => ({ ok: true, status: 200, body: HTML, finalUrl: "https://example.com/x", headers: {} }),
-			searchCacheTtlMs: SEARCH_CACHE_TTL_MS, fresh: false,
-			fetchCountByTask: new Map(), seq: { source: 1, evidence: 1 },
+			run,
+			store,
+			cache: new ResearchCache(dir),
+			searchProvider: createMockProvider({
+				defaultBehavior: { kind: "results", results: [{ url: "https://example.com/x", title: "t", snippet: "s" }] },
+			}),
+			fetcher: async (): Promise<HttpResult> => ({
+				ok: true,
+				status: 200,
+				body: HTML,
+				finalUrl: "https://example.com/x",
+				headers: {},
+			}),
+			searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
+			fresh: false,
+			fetchCountByTask: new Map(),
+			seq: { source: 1, evidence: 1 },
 		};
 		const envA: ToolEnv = { ...sharedEnv, currentTask: makeTask("T1") };
 		const envB: ToolEnv = { ...sharedEnv, currentTask: makeTask("T2") };

@@ -21,6 +21,8 @@ export interface HttpFailure {
 	failureType: FailureType;
 	status?: number;
 	message: string;
+	/** 429 时服务器要求的等待毫秒数（来自 Retry-After 头） */
+	retryAfterMs?: number;
 }
 
 export interface HttpSuccess {
@@ -221,7 +223,22 @@ export async function fetchOnce(url: string, options: FetchOnceOptions): Promise
 
 			if (status >= 400 && status < 500) {
 				await response.body.dump();
-				return { ok: false, failureType: "http_4xx", status, message: `HTTP ${status}` };
+				const failure: HttpFailure = { ok: false, failureType: "http_4xx", status, message: `HTTP ${status}` };
+				// 429：提取 Retry-After（秒数或 HTTP 日期），供重试延迟使用
+				if (status === 429) {
+					const retryAfter = headers["retry-after"];
+					const value = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
+					if (typeof value === "string" && value !== "") {
+						const seconds = Number(value);
+						if (Number.isFinite(seconds)) {
+							failure.retryAfterMs = seconds * 1000;
+						} else {
+							const date = Date.parse(value);
+							if (!Number.isNaN(date)) failure.retryAfterMs = Math.max(0, date - Date.now());
+						}
+					}
+				}
+				return failure;
 			}
 			if (status >= 500) {
 				await response.body.dump();
@@ -298,7 +315,11 @@ export async function fetchWithRetry(url: string, options: FetchWithRetryOptions
 
 		let delay: number;
 		if (failureType === "rate_limit") {
-			delay = RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
+			// Retry-After 优先（服务器明确要求），否则固定退避序列
+			delay =
+				result.retryAfterMs !== undefined && attempt === 0
+					? result.retryAfterMs
+					: RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
 		} else {
 			delay = BACKOFF_BASE_MS[Math.min(attempt, BACKOFF_BASE_MS.length - 1)];
 		}
