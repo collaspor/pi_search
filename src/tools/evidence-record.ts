@@ -78,7 +78,7 @@ export function createEvidenceRecordTool(env: ToolEnv): AgentTool<typeof RecordP
 			}
 
 			const evidence: Evidence = {
-				id: `e${env.nextEvidenceSeq++}`,
+				id: `e${env.seq.evidence++}`,
 				taskId: task.id,
 				sourceId: source.id,
 				quote,

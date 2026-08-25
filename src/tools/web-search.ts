@@ -40,7 +40,7 @@ export async function registerSourcesFromResults(env: ToolEnv, results: SearchRe
 			sourceIds.push(existing.id);
 			continue;
 		}
-		const id = `s${env.nextSourceSeq++}`;
+		const id = `s${env.seq.source++}`;
 		const body = item.snippet;
 		const source: Source = {
 			id,

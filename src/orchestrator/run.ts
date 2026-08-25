@@ -1,21 +1,26 @@
 /**
  * ResearchOrchestrator（PRD §3）。
  *
- * M3 交付范围：comprehending → planning 两个阶段 + checkpoint。
- * researching / reporting / verifying 在 M4~M7 接入。
+ * 全流程：comprehending → planning → researching → reporting → verifying(L1)。
+ * L2 语义校验在 M7 接入。
  *
  * 事件纪律（§4.0.1）：先 appendEvent，阶段结束时 writeSnapshot。
  */
 
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { ResearchCache, SEARCH_CACHE_TTL_MS } from "../net/cache.ts";
 import { fetchWithRetry } from "../net/http.ts";
 import { createTavilyProvider } from "../providers/tavily.ts";
 import type { SearchProvider } from "../providers/types.ts";
+import { renderGaps } from "../report/gaps.ts";
+import { removeViolatingCitations, renderReport } from "../report/markdown.ts";
 import { comprehend } from "../roles/comprehender.ts";
 import { executeTask } from "../roles/executor.ts";
 import { plan } from "../roles/planner.ts";
+import { report } from "../roles/reporter.ts";
+import { l1ErrorMessages, verifyL1 } from "../roles/verifier-l1.ts";
 import type { ToolEnv } from "../tools/env.ts";
 import type { ResearchBrief, ResearchRun, Task } from "../types.ts";
 import { CheckpointStore } from "./checkpoint.ts";
@@ -182,8 +187,7 @@ export async function orchestrate(options: OrchestrateOptions): Promise<Orchestr
 		searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
 		fresh: options.fresh ?? false,
 		fetchCountByTask: new Map(),
-		nextSourceSeq: 1,
-		nextEvidenceSeq: 1,
+		seq: { source: 1, evidence: 1 },
 	};
 
 	const layers = topologicalLayers(planned.plan.tasks);
@@ -233,8 +237,143 @@ export async function orchestrate(options: OrchestrateOptions): Promise<Orchestr
 		});
 	}
 
-	// reporting / verifying 阶段：M5~M7 接入
-	options.onProgress?.(`研究完成：共 ${run.evidence.length} 条证据。报告生成将在下一里程碑接入。`);
+	// ── Phase 4: reporting ─────────────────────────────────────
+	run.status = "reporting";
+	await store.appendEvent({ type: "phase_enter", phase: "reporting" });
+	options.onProgress?.(`研究完成：共 ${run.evidence.length} 条证据。生成报告中…`);
+
+	const reported = await report({
+		model: options.model,
+		input: { brief: run.brief!, query: run.query, evidence: run.evidence, sources: run.sources },
+		apiKey: options.apiKey,
+		headers: options.headers,
+		signal: options.signal,
+	});
+
+	if (!reported.ok) {
+		// Reporter 失败：failed + 存根报告（§8.4 前置门禁语义）
+		run.status = "failed";
+		run.report = buildStubReport(run, `报告生成失败：${reported.reason}`);
+		await store.appendEvent({ type: "run_end", status: "failed" });
+		await writeReport(runDir, run.report);
+		await snapshot();
+		options.onProgress?.("报告生成失败，已落盘存根。");
+		return { run, runDir, cancelled: false };
+	}
+
+	run.claims = reported.claims!;
+	await store.appendEvent({ type: "claims_ready", claims: run.claims });
+
+	// 渲染：剥离 LLM 自写的定义行，代码重建脚注
+	const sourcesByEvidence = new Map(
+		run.evidence
+			.map((e) => [e.id, run.sources.find((s) => s.id === e.sourceId)])
+			.filter((pair): pair is [string, (typeof run.sources)[number]] => pair[1] !== undefined),
+	);
+	const evidenceIdSet = new Set(run.evidence.map((e) => e.id));
+	let rendered = renderReport(reported.markdown!, evidenceIdSet, sourcesByEvidence);
+
+	// ── Phase 5: verifying (L1) ────────────────────────────────
+	run.status = "verifying";
+	await store.appendEvent({ type: "phase_enter", phase: "verifying" });
+
+	let l1 = await verifyL1({ run, store, renderedMarkdown: rendered.markdown });
+	let finalMarkdown = rendered.markdown;
+
+	if (!l1.passed && !run.budget.tripped) {
+		// 回灌修正 1 次（硬上限）
+		const errors = l1ErrorMessages(l1);
+		options.onProgress?.(`L1 校验未通过（${errors.length} 类问题），回灌修正中…`);
+		const revised = await report({
+			model: options.model,
+			input: { brief: run.brief!, query: run.query, evidence: run.evidence, sources: run.sources },
+			apiKey: options.apiKey,
+			headers: options.headers,
+			signal: options.signal,
+			previousErrors: errors,
+		});
+		if (revised.ok) {
+			run.claims = revised.claims!;
+			await store.appendEvent({ type: "claims_ready", claims: run.claims });
+			rendered = renderReport(revised.markdown!, evidenceIdSet, sourcesByEvidence);
+			const l1Second = await verifyL1({ run, store, renderedMarkdown: rendered.markdown });
+			if (l1Second.passed) {
+				l1 = l1Second;
+				finalMarkdown = rendered.markdown;
+			} else {
+				// 修正失败：确定性剔除违规引用
+				l1 = l1Second;
+				finalMarkdown = removeViolatingCitations(rendered.markdown, new Set(l1.danglingCitations));
+				run.claims = run.claims.filter((c) => !c.evidenceIds.some((id) => l1.danglingCitations.includes(id)));
+				finalMarkdown = renderReport(finalMarkdown, evidenceIdSet, sourcesByEvidence).markdown;
+			}
+		} else {
+			// 修正轮 Reporter 失败：剔除违规引用
+			finalMarkdown = removeViolatingCitations(rendered.markdown, new Set(l1.danglingCitations));
+			run.claims = run.claims.filter((c) => !c.evidenceIds.some((id) => l1.danglingCitations.includes(id)));
+			finalMarkdown = renderReport(finalMarkdown, evidenceIdSet, sourcesByEvidence).markdown;
+		}
+	} else if (!l1.passed && run.budget.tripped) {
+		// 预算熔断：跳过回灌，直接剔除
+		finalMarkdown = removeViolatingCitations(rendered.markdown, new Set(l1.danglingCitations));
+		run.claims = run.claims.filter((c) => !c.evidenceIds.some((id) => l1.danglingCitations.includes(id)));
+		finalMarkdown = renderReport(finalMarkdown, evidenceIdSet, sourcesByEvidence).markdown;
+	}
+
+	// 终态判定 + 报告组装
+	const hasUnresolved = (run.plan?.tasks ?? []).some((t) => t.status === "unresolved" || t.status === "failed");
+	const passed = l1.passed && !hasUnresolved && run.claims.length > 0;
+	run.status = run.claims.length === 0 ? "failed" : passed ? "completed" : "partial";
+
+	const gaps = renderGaps(run);
+	const l1Note = l1.passed
+		? `- 结构校验：通过（0 悬空引用，${l1.coverage.filter((c) => c.claimCount > 0).length}/${l1.coverage.length} 判据覆盖）`
+		: `- 结构校验：降级通过（剔除 ${l1.danglingCitations.length} 处违规引用后结报）`;
+	const verificationSection = ["", "## 校验结果", "", l1Note, `- 语义校验（L2）：将在下一里程碑接入`].join("\n");
+
+	run.report = [finalMarkdown.trimEnd(), gaps, verificationSection].filter(Boolean).join("\n\n");
+	run.verification = { l1, l2: [], l2Skipped: "L2 将在 M7 接入" };
+
+	await store.appendEvent({ type: "verification_done", report: run.verification });
+	await store.appendEvent({ type: "run_end", status: run.status });
+	await writeReport(runDir, run.report);
+	await snapshot();
+
+	options.onProgress?.(`报告完成：${run.status}，${run.claims.length} 条结论。${join(runDir, "report.md")}`);
 
 	return { run, runDir, cancelled: false };
+}
+
+/** 失败存根报告（§8.4 前置门禁：failed 也落盘，说明原因与已完成部分） */
+function buildStubReport(run: ResearchRun, reason: string): string {
+	const brief = run.brief;
+	const plannedTasks = run.plan?.tasks ?? [];
+	const doneTasks = plannedTasks.filter((t) => t.status === "success");
+	return [
+		`# 研究未完成：${run.query}`,
+		"",
+		`状态：failed（${reason}）`,
+		`已用：↑${run.budget.usedTokens} tokens  $${run.budget.usedCostUsd.toFixed(4)}`,
+		"",
+		"## 已完成的部分",
+		"",
+		brief ? `- 研究目标已明确：${brief.goal}` : "- （目标理解未完成）",
+		plannedTasks.length > 0
+			? `- 已规划 ${plannedTasks.length} 个任务，其中 ${doneTasks.length} 个完成`
+			: "- （任务规划未完成）",
+		`- 已收集 ${run.evidence.length} 条证据（见 run.json）`,
+		"",
+		"## 建议",
+		"",
+		`调整预算或网络后，可用完整数据（${run.id}）重新研究。`,
+	].join("\n");
+}
+
+/** 原子落盘 report.md */
+async function writeReport(runDir: string, markdown: string): Promise<void> {
+	const path = join(runDir, "report.md");
+	const tmp = `${path}.tmp`;
+	await writeFile(tmp, markdown, "utf8");
+	const { rename } = await import("node:fs/promises");
+	await rename(tmp, path);
 }

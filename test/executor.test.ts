@@ -105,8 +105,7 @@ async function setupEnv(run: ResearchRun, _task: Task): Promise<ToolEnv> {
 		searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
 		fresh: false,
 		fetchCountByTask: new Map(),
-		nextSourceSeq: 1,
-		nextEvidenceSeq: 1,
+		seq: { source: 1, evidence: 1 },
 	};
 }
 

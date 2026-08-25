@@ -28,9 +28,12 @@ export interface ToolEnv {
 	fresh: boolean;
 	/** 每个 Task 的 fetch 次数计数（Budget.maxFetchPerTask） */
 	fetchCountByTask: Map<string, number>;
-	/** 下一个 source / evidence 序号 */
-	nextSourceSeq: number;
-	nextEvidenceSeq: number;
+	/**
+	 * source / evidence 序号分配器（引用类型，跨 taskEnv 视图共享）。
+	 * 浅拷贝 {...env} 会复制 number 原始值导致各 Task id 重复（真实 bug），
+	 * 必须用对象引用保证全局唯一单调递增。
+	 */
+	seq: { source: number; evidence: number };
 }
 
 /** URL 规范化：去 utm_* 参数、去 fragment、去尾斜杠，用于去重与缓存键 */

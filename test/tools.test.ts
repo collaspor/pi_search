@@ -126,8 +126,7 @@ async function setupEnv(options?: {
 		searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
 		fresh: false,
 		fetchCountByTask: new Map(),
-		nextSourceSeq: 1,
-		nextEvidenceSeq: 1,
+		seq: { source: 1, evidence: 1 },
 	};
 	return { env, task, fetchCalls };
 }
