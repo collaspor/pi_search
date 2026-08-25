@@ -52,6 +52,19 @@ export async function checkBudgetTrip(
 	return dimension;
 }
 
+/**
+ * 崩溃/中断的闲置时长不计入 wall-clock 预算（A9 修复）：
+ * resume 时按最后活跃时间（run.updatedAt）顺延 startedAt，
+ * 否则崩溃间隔会被 checkBudgetTrip 误判为 time 熔断，跳过 L1 修正轮与 L2。
+ * 返回顺延的毫秒数（未顺延时为 0）。
+ */
+export function compensateBudgetIdleGap(run: ResearchRun, now = Date.now()): number {
+	const gapMs = now - run.updatedAt;
+	if (gapMs <= 0) return 0;
+	run.budget.startedAt += gapMs;
+	return gapMs;
+}
+
 // ============================================================================
 // 进入 reporting 的前置门禁（§8.4 评审修正 P0-2）
 // ============================================================================

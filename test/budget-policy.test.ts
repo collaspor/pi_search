@@ -7,7 +7,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { checkBudgetTrip, reportingGate } from "../src/orchestrator/budget.ts";
+import { checkBudgetTrip, compensateBudgetIdleGap, reportingGate } from "../src/orchestrator/budget.ts";
 import { CheckpointStore } from "../src/orchestrator/checkpoint.ts";
 import {
 	FailureTracker,
@@ -110,6 +110,29 @@ describe("checkBudgetTrip 三维熔断", () => {
 		const count = run.recoveries.length;
 		await checkBudgetTrip(run, store);
 		expect(run.recoveries.length).toBe(count);
+	});
+});
+
+describe("compensateBudgetIdleGap — resume 时 wall-clock 预算顺延（A9 回归）", () => {
+	it("崩溃中断时长顺延 startedAt，避免 time 维度误判熔断", () => {
+		// 场景还原：startedAt=1000，2000 时崩溃（最后活跃），100000 时 resume。
+		// 中断 98s 不计入 5s 的 maxWallClockMs。
+		const run = makeRun();
+		run.budget.startedAt = 1_000;
+		run.updatedAt = 2_000;
+		const gap = compensateBudgetIdleGap(run, 100_000);
+		expect(gap).toBe(98_000);
+		expect(run.budget.startedAt).toBe(99_000);
+		expect(100_000 - run.budget.startedAt).toBeLessThan(run.budget.maxWallClockMs);
+	});
+
+	it("updatedAt 与 now 相同或在未来 → 不顺延", () => {
+		const run = makeRun();
+		run.budget.startedAt = 1_000;
+		run.updatedAt = 5_000;
+		expect(compensateBudgetIdleGap(run, 5_000)).toBe(0);
+		expect(compensateBudgetIdleGap(run, 4_000)).toBe(0);
+		expect(run.budget.startedAt).toBe(1_000);
 	});
 });
 

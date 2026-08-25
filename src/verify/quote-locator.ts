@@ -16,6 +16,8 @@ import type { QuoteMatchLevel } from "../types.ts";
 
 export const MIN_FUZZY_LENGTH = 30;
 export const DEFAULT_FUZZY_THRESHOLD = 0.9;
+/** fuzzy 候选窗口硬上限：超过则判 not found（宁缺毋滥，防止病态重复正文拖垮 CPU）。 */
+export const MAX_FUZZY_CANDIDATES = 2000;
 
 export interface LocateOk {
 	found: true;
@@ -203,19 +205,48 @@ export function locateQuote(body: string, quote: string, options?: LocateOptions
 	const threshold = options?.fuzzyThreshold ?? DEFAULT_FUZZY_THRESHOLD;
 	const quoteNumbers = extractNumbers(quoteNorm.normalized);
 	const windowLen = quoteNorm.normalized.length;
+	const bodyText = bodyNorm.normalized;
+
+	// ── 锚点预筛（A9 性能修复）────────────────────────────────────────
+	// 旧实现：对正文每个起点滑动窗口 + Levenshtein DP，复杂度 O(N×M²)。
+	// 大正文（数万字符）下是数十亿次同步操作，阻塞 event loop——此时连
+	// LLM 超时都无法触发（JS 单线程）。T6 真实运行因此卡顿 7 分 46 秒。
+	// 改为：quote 等距取 3 个锚点片段在正文中 indexOf 定位，仅评估锚点
+	// 命中位置 ± slack 范围内的候选窗口；3 个锚点全部零命中（差异过大，
+	// fuzzy 也救不回来）或候选数超上限时直接判 not found，计算量有界。
+	const anchorLen = Math.min(12, Math.max(8, Math.floor(windowLen / 4)));
+	const slack = Math.ceil(windowLen * 0.15);
+	const minWLen = Math.ceil(windowLen * 0.9);
+	const candidates = new Set<number>();
+	for (const ratio of [0.25, 0.5, 0.75]) {
+		const qOff = Math.min(Math.floor(windowLen * ratio), windowLen - anchorLen);
+		if (qOff < 0) continue;
+		const anchor = quoteNorm.normalized.slice(qOff, qOff + anchorLen);
+		let hit = bodyText.indexOf(anchor);
+		while (hit !== -1) {
+			const base = hit - qOff;
+			for (let s = base - slack; s <= base + slack; s++) {
+				if (s >= 0 && s + minWLen <= bodyText.length) candidates.add(s);
+			}
+			hit = bodyText.indexOf(anchor, hit + 1);
+		}
+	}
 
 	let best: { score: number; start: number } | undefined;
-	// 滑动窗口：以 quote 长度为基准，±20% 容差内取若干窗口尺寸
-	for (const wLen of [windowLen, Math.ceil(windowLen * 1.1), Math.ceil(windowLen * 0.9)]) {
-		for (let i = 0; i + wLen <= bodyNorm.normalized.length; i++) {
-			const window = bodyNorm.normalized.slice(i, i + wLen);
-			// 数字保护前置过滤：窗口必须先通过数字校验才值得算相似度
-			if (quoteNumbers.length > 0 && !numbersEqual(quoteNumbers, extractNumbers(window))) {
-				continue;
-			}
-			const score = similarity(quoteNorm.normalized, window);
-			if (score >= threshold && (best === undefined || score > best.score)) {
-				best = { score, start: i };
+	if (candidates.size <= MAX_FUZZY_CANDIDATES) {
+		// 滑动窗口：以 quote 长度为基准，±20% 容差内取若干窗口尺寸
+		for (const i of candidates) {
+			for (const wLen of [windowLen, Math.ceil(windowLen * 1.1), minWLen]) {
+				if (i + wLen > bodyText.length) continue;
+				const window = bodyText.slice(i, i + wLen);
+				// 数字保护前置过滤：窗口必须先通过数字校验才值得算相似度
+				if (quoteNumbers.length > 0 && !numbersEqual(quoteNumbers, extractNumbers(window))) {
+					continue;
+				}
+				const score = similarity(quoteNorm.normalized, window);
+				if (score >= threshold && (best === undefined || score > best.score)) {
+					best = { score, start: i };
+				}
 			}
 		}
 	}
@@ -223,7 +254,10 @@ export function locateQuote(body: string, quote: string, options?: LocateOptions
 	if (best === undefined) {
 		return {
 			found: false,
-			reason: `quote not found within fuzzy threshold ${threshold} (numbers must match exactly)`,
+			reason:
+				candidates.size > MAX_FUZZY_CANDIDATES
+					? `fuzzy infeasible: ${candidates.size} candidate windows exceed limit ${MAX_FUZZY_CANDIDATES}`
+					: `quote not found within fuzzy threshold ${threshold} (numbers must match exactly)`,
 		};
 	}
 

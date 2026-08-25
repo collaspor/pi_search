@@ -112,6 +112,34 @@ describe("短引用保护", () => {
 	});
 });
 
+describe("fuzzy 性能回归（A9：大正文 CPU 爆炸修复）", () => {
+	it("大正文 + 无数字的不存在 quote：锚点零命中，毫秒级返回", () => {
+		// ≈5 万字符正文。旧实现对每个起点跑 Levenshtein，需数十亿次操作
+		const chunk = "the quick brown fox jumps over the lazy dog and runs through the forest near riverbank. ";
+		const bigBody = chunk.repeat(560);
+		const quote = "a completely absent sentence that never appears anywhere inside this particular document at all";
+		const t0 = Date.now();
+		const r = locateQuote(bigBody, quote);
+		expect(Date.now() - t0).toBeLessThan(2000);
+		expect(r.found).toBe(false);
+	});
+
+	it("大正文中模糊 quote 仍可命中：锚点容错（部分锚点落在差异内不影响）", () => {
+		const chunk =
+			"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore. ";
+		const target =
+			"the research report concluded that agent orchestration has become a core metric for enterprise procurement teams";
+		const bigBody = chunk.repeat(300) + target + chunk.repeat(300);
+		// 一处改动（差异落入中部锚点，两侧锚点仍命中），无数字，相似度 ≈0.95
+		const quote = target.replace("has become", "became");
+		const t0 = Date.now();
+		const r = locateQuote(bigBody, quote);
+		expect(Date.now() - t0).toBeLessThan(2000);
+		expect(r.found).toBe(true);
+		if (r.found) expect(bigBody.slice(r.start, r.end)).toContain("agent orchestration");
+	});
+});
+
 describe("extractNumbers", () => {
 	it("提取并归一化千分位", () => {
 		expect(extractNumbers("达到 1,280 亿美元，增长 34.5%")).toEqual(["1280", "34.5%"]);

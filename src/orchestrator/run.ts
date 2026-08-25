@@ -24,7 +24,7 @@ import { l1ErrorMessages, verifyL1 } from "../roles/verifier-l1.ts";
 import { isAllSupported, verifyL2 } from "../roles/verifier-l2.ts";
 import type { ToolEnv } from "../tools/env.ts";
 import type { L2ClaimVerdict, ResearchBrief, ResearchRun, Task } from "../types.ts";
-import { checkBudgetTrip, reportingGate } from "./budget.ts";
+import { checkBudgetTrip, compensateBudgetIdleGap, reportingGate } from "./budget.ts";
 import { CheckpointStore, readEvents } from "./checkpoint.ts";
 import { FailureTracker, runTaskWithRecovery, shouldReplan } from "./failure-policy.ts";
 import { replayEvents } from "./replay.ts";
@@ -303,6 +303,21 @@ export async function orchestrate(options: OrchestrateOptions): Promise<Orchestr
 		}
 	}
 
+	// ── Phase 4+5: reporting & verifying（抽为独立函数，resume 复用）──
+	return runReportingPhase(run, runDir, store, snapshot, options);
+}
+
+/**
+ * reporting → verifying(L1+L2) → 终态组装（orchestrate 与 resume 共用）。
+ * 前置：run.brief 存在、run.evidence 已收集（可能为 0）。
+ */
+async function runReportingPhase(
+	run: ResearchRun,
+	runDir: string,
+	store: CheckpointStore,
+	snapshot: () => Promise<void>,
+	options: OrchestrateOptions,
+): Promise<OrchestrateResult> {
 	// ── Phase 4: reporting（M6：前置门禁 §8.4）─────────────────
 	const gate = reportingGate(run);
 	if (gate.action === "failed_stub") {
@@ -529,6 +544,12 @@ export async function resumeRun(options: OrchestrateOptions & { runId: string })
 		return { run, runDir, cancelled: false };
 	}
 
+	// A9 修复：崩溃/中断的闲置时长不计入 wall-clock 预算，顺延计时起点
+	const gapMs = compensateBudgetIdleGap(run);
+	if (gapMs > 0) {
+		options.onProgress?.(`预算计时起点顺延 ${Math.round(gapMs / 1000)}s（崩溃中断时长不计入）`);
+	}
+
 	// 续跑：从未完成阶段继续。M7 实现 researching 阶段的续跑；
 	// comprehending/planning 阶段极快，崩溃概率低，直接重跑整个 orchestrate 更简单。
 	if (run.status === "researching" && run.plan) {
@@ -550,6 +571,22 @@ async function resumeResearching(
 	options: OrchestrateOptions,
 ): Promise<OrchestrateResult> {
 	const tasks = run.plan!.tasks;
+	// A9 修复：崩溃中断的 running 任务（有 task_start 无 task_end）先收尾——按已记录的
+	// 证据数判定终态并补 task_end 事件。不重跑：避免重复消耗 LLM tokens 与重复记录证据，
+	// 崩溃任务拿到多少算多少，符合 §8.4 失败收敛原则。
+	for (const task of tasks) {
+		if (task.status !== "running") continue;
+		task.evidenceCount = run.evidence.filter((e) => e.taskId === task.id).length;
+		task.status = task.evidenceCount >= task.minEvidence ? "success" : "unresolved";
+		task.finishedAt = run.updatedAt;
+		await store.appendEvent({
+			type: "task_end",
+			taskId: task.id,
+			status: task.status,
+			evidenceCount: task.evidenceCount,
+		});
+		options.onProgress?.(`[${task.id}] 崩溃中断收尾：${task.evidenceCount} 条证据 → ${task.status}`);
+	}
 	const pendingTasks = resumeFromTaskId ? tasks.filter((t) => t.status === "pending") : [];
 	if (pendingTasks.length === 0) {
 		options.onProgress?.("所有任务已完成，进入报告阶段（由主流程处理）。");
@@ -610,7 +647,7 @@ async function resumeResearching(
 		if (run.budget.tripped !== undefined) break;
 	}
 
-	options.onProgress?.(`续跑完成：共 ${run.evidence.length} 条证据。报告阶段由主流程继续。`);
-	// 报告阶段逻辑与主流程一致，交给 orchestrate 后续（此处直接返回，由 index.ts 引导重跑报告）
-	return { run, runDir, cancelled: false };
+	// 续跑完 Task 后接着走完 reporting/verifying（M8：resume 必须能出报告）
+	options.onProgress?.(`续跑完成：共 ${run.evidence.length} 条证据。进入报告阶段…`);
+	return runReportingPhase(run, runDir, store, snapshot, options);
 }

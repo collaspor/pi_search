@@ -182,11 +182,11 @@ cd packages/deep-research
 node ../../node_modules/vitest/dist/cli.js --run test/
 ```
 
-**239 个测试，全部离线可跑**（faux provider + 注入桩 + mock DNS，零真实网络/LLM 依赖）：
+**243 个测试，全部离线可跑**（faux provider + 注入桩 + mock DNS，零真实网络/LLM 依赖）：
 
 - SSRF 防护（72 例：302 跳私网、IPv4-mapped、DNS rebinding、整数 IPv4 绕过……）
 - 提示注入防护（12 例：真实注入载荷、边界逃逸、Markdown 伪造）
-- quote 三级定位（20 例：全角半角、数字篡改、短引用禁 fuzzy、阈值边界）
+- quote 三级定位（22 例：全角半角、数字篡改、短引用禁 fuzzy、阈值边界、大正文性能回归）
 - 血缘覆盖度（含"Reporter 打满 SC 标签不得通过"的反绕过用例）
 - 失败策略（24 例：策略池顺序、硬计数上限、Budget 三维熔断、Re-plan 判定）
 - 超时收敛（LLM 挂起→降级结局，不冻结）
@@ -212,7 +212,7 @@ node ../../node_modules/vitest/dist/cli.js --run test/
 - **预算是软上限**：每 Task 结束才检查熔断，实际消耗可能略超设定值（设计取舍，逐 token 拦截成本过高）
 - **校验判据由 LLM 生成**：successCriteria 若跑偏，会形成"用错误标准验证错误报告"。缓解：Brief 人工确认默认开启（全流程唯一人工纠偏窗口）
 - **L2 同源偏差**：Reporter 与 Verifier 若用同一模型，共享先验与幻觉倾向。缓解：`--research-verifier-model` 可指定不同模型
-- **fuzzy 阈值 0.90 为起始值**：待真实数据标定；已通过"短引用禁 fuzzy + 数字逐一比对"将风险限制在数据层
+- **fuzzy 阈值 0.90 已经真实数据标定**：56 条证据（fuzzy 12 条）命中 score 全部 ≥0.906，阈值保留；实现已改为锚点预筛（修复大正文 O(N×M²) CPU 爆炸，A9 实测卡顿 7 分 46 秒 → 毫秒级）
 
 ---
 
