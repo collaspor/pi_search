@@ -1,0 +1,43 @@
+{
+	"name": "@earendil-works/pi-deep-research",
+	"version": "0.84.2",
+	"private": true,
+	"description": "Deep research agent extension for pi: plan, search, gather evidence, and produce citation-traceable reports",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run"
+	},
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"dependencies": {
+		"@mozilla/readability": "0.6.0",
+		"linkedom": "0.18.13",
+		"typebox": "1.3.7",
+		"undici": "8.9.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "^0.84.2",
+		"@earendil-works/pi-ai": "^0.84.2",
+		"@earendil-works/pi-coding-agent": "^0.84.2",
+		"@types/node": "22.19.19",
+		"shx": "0.4.0",
+		"vitest": "4.1.9"
+	}
+}
