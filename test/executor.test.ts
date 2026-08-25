@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ResearchCache, SEARCH_CACHE_TTL_MS } from "../src/net/cache.ts";
 import type { HttpResult } from "../src/net/http.ts";
 import { CheckpointStore } from "../src/orchestrator/checkpoint.ts";
+import { FailureTracker } from "../src/orchestrator/failure-policy.ts";
 import { createMockProvider } from "../src/providers/mock.ts";
 import { executeTask } from "../src/roles/executor.ts";
 import type { ToolEnv } from "../src/tools/env.ts";
@@ -256,5 +257,101 @@ describe("executeTask（A3/A4 端到端）", () => {
 		const outcome = await executeTask(env, task, { model: faux.getModel() });
 		expect(outcome.status).toBe("failed");
 		expect(outcome.error).toContain("simulated stream failure");
+	});
+
+	it("Query Rewrite（实验 B 端到端）：搜索连续空结果 → 策略池引导 → 模型改写查询重搜成功", async () => {
+		const faux = registerFauxProvider({});
+		registrations.push(faux);
+		const run = makeRun();
+		const task = makeTask();
+		task.minEvidence = 1;
+
+		// 搜索 provider：前两次空结果，第三次（改写后的查询）有结果
+		const searchQueries: string[] = [];
+		const provider = {
+			id: "mock",
+			async search(input: { query: string; maxResults: number }) {
+				searchQueries.push(input.query);
+				if (searchQueries.length < 3) {
+					return {
+						ok: false as const,
+						provider: "mock",
+						query: input.query,
+						failureType: "no_search_result" as const,
+						message: "0 results",
+					};
+				}
+				return {
+					ok: true as const,
+					provider: "mock",
+					query: input.query,
+					results: [
+						{
+							url: "https://example.com/found",
+							title: "找到了",
+							snippet: ARTICLE.slice(0, 80),
+							rawContent: ARTICLE,
+						},
+					],
+					fromCache: false,
+				};
+			},
+		};
+
+		const store = await CheckpointStore.create(dir, run.id);
+		const env: ToolEnv = {
+			run,
+			store,
+			cache: new ResearchCache(dir),
+			searchProvider: provider,
+			fetcher: async (): Promise<HttpResult> => ({
+				ok: true,
+				status: 200,
+				body: HTML_PAGE,
+				finalUrl: "https://example.com/found",
+				headers: {},
+			}),
+			searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
+			fresh: false,
+			fetchCountByTask: new Map(),
+			seq: { source: 1, evidence: 1 },
+			failureTracker: new FailureTracker(),
+		};
+
+		// 模型脚本：搜索(空) → 收到改写指引后用新查询重搜(空) → 再改写重搜(有) → fetch → record
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("web_search", { query: "量子波动速读仪" }), { stopReason: "toolUse" }),
+			// 模型按 FailureTracker 的指引改写查询
+			(ctx) => {
+				const last = ctx.messages.filter((m) => m.role === "toolResult").pop();
+				const text = last && "content" in last ? JSON.stringify(last.content) : "";
+				// 验证指引包含改写策略提示
+				expect(text).toMatch(/rewrite attempt|strategy/i);
+				return fauxAssistantMessage(fauxToolCall("web_search", { query: "quantum speed reading device" }), {
+					stopReason: "toolUse",
+				});
+			},
+			fauxAssistantMessage(fauxToolCall("web_search", { query: "speed reading" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("web_fetch", { url: "https://example.com/found" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(
+				fauxToolCall("evidence_record", {
+					sourceId: "s1",
+					quote: "人工智能代理市场规模在2026年预计达到1280亿美元",
+					summary: "s",
+					stance: "support",
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(fauxText("完成")),
+		]);
+
+		const outcome = await executeTask(env, task, { model: faux.getModel() });
+		expect(outcome.status).toBe("success");
+		// 核心断言：模型用了 3 个不同的查询（改写生效），且第 3 次成功
+		expect(searchQueries.length).toBe(3);
+		expect(new Set(searchQueries).size).toBe(3);
+		expect(task.evidenceCount).toBe(1);
 	});
 });
